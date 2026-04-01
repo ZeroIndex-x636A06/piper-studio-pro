@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+
+import gi
+import os
+import subprocess
+import threading
+import json
+import urllib.request
+from datetime import datetime
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, Gio, GLib
+
+VOICE_DIR = os.path.expanduser("~/.local/share/piper/voices")
+os.makedirs(VOICE_DIR, exist_ok=True)
+
+class PiperStudio(Adw.Application):
+    def __init__(self):
+        # UPDATED APPLICATION ID
+        super().__init__(application_id="com.zeroindex.piperstudio", flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        
+        action_about = Gio.SimpleAction.new("about", None)
+        action_about.connect("activate", self.on_about_action)
+        self.add_action(action_about)
+
+        action_manage = Gio.SimpleAction.new("manage", None)
+        action_manage.connect("activate", self.on_manage_action)
+        self.add_action(action_manage)
+
+    def do_activate(self):
+        self.win = Adw.ApplicationWindow(application=self, title="Piper Studio Pro", default_width=800, default_height=750)
+        
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        
+        menu = Gio.Menu()
+        menu.append("Manage Voices", "app.manage")
+        menu.append("About Piper Studio", "app.about")
+        
+        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu_btn.set_menu_model(menu)
+        menu_btn.set_tooltip_text("Menu")
+        header.pack_start(menu_btn) 
+        
+        view.add_top_bar(header)
+        
+        toast_overlay = Adw.ToastOverlay()
+        view.set_content(toast_overlay)
+        self.win.set_content(view)
+        
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=20, margin_bottom=20, margin_start=20, margin_end=20)
+        toast_overlay.set_child(main_box)
+
+        # --- VOICE MANAGEMENT ---
+        voice_group = Adw.PreferencesGroup(title="Voice Library")
+        main_box.append(voice_group)
+
+        self.model_list = Gtk.StringList()
+        self.voice_combo = Adw.ComboRow(title="Selected Voice", subtitle="Models found in ~/.local/share/piper/voices", model=self.model_list)
+        voice_group.add(self.voice_combo)
+
+        btn_download = Gtk.Button(label="Browse Official Voices", margin_top=6)
+        btn_download.add_css_class("pill")
+        btn_download.connect("clicked", self.on_browse_voices)
+        voice_group.add(btn_download)
+
+        # --- CUSTOM COMMUNITY DOWNLOAD ---
+        custom_dl_group = Adw.PreferencesGroup(title="Download Custom Community Model")
+        main_box.append(custom_dl_group)
+
+        self.custom_url_entry = Adw.EntryRow(title="Direct .onnx URL (Must end in .onnx)")
+        custom_dl_group.add(self.custom_url_entry)
+
+        btn_custom_dl = Gtk.Button(label="Fetch Custom Model", margin_top=6)
+        btn_custom_dl.connect("clicked", self.on_custom_download)
+        custom_dl_group.add(btn_custom_dl)
+
+        # --- INPUT ---
+        input_frame = Gtk.Frame(label="Script Content")
+        self.text_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD, height_request=150)
+        scrolled = Gtk.ScrolledWindow(child=self.text_view, vexpand=True)
+        input_frame.set_child(scrolled)
+        main_box.append(input_frame)
+
+        # --- TUNING ---
+        tuning_group = Adw.PreferencesGroup(title="Live Audio Tuning")
+        main_box.append(tuning_group)
+
+        self.speed_adj = Gtk.Adjustment(lower=0.5, upper=2.0, value=1.0, step_increment=0.01, page_increment=0.1)
+        speed_row = Adw.ActionRow(title="Speed", subtitle="1.0 is default")
+        speed_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12, valign=Gtk.Align.CENTER)
+        speed_box.set_hexpand(True) 
+        speed_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.speed_adj)
+        speed_scale.set_hexpand(True) 
+        speed_scale.set_draw_value(False) 
+        speed_box.append(speed_scale)
+        speed_spin = Gtk.SpinButton(adjustment=self.speed_adj, digits=2, climb_rate=0.01)
+        speed_spin.set_valign(Gtk.Align.CENTER)
+        speed_box.append(speed_spin)
+        speed_row.add_suffix(speed_box)
+        tuning_group.add(speed_row)
+
+        self.pitch_adj = Gtk.Adjustment(lower=0.5, upper=1.5, value=1.0, step_increment=0.01, page_increment=0.1)
+        pitch_row = Adw.ActionRow(title="Pitch Shift", subtitle="Vocal tone adjustment")
+        pitch_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12, valign=Gtk.Align.CENTER)
+        pitch_box.set_hexpand(True)
+        pitch_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.pitch_adj)
+        pitch_scale.set_hexpand(True)
+        pitch_scale.set_draw_value(False)
+        pitch_box.append(pitch_scale)
+        pitch_spin = Gtk.SpinButton(adjustment=self.pitch_adj, digits=2, climb_rate=0.01)
+        pitch_spin.set_valign(Gtk.Align.CENTER)
+        pitch_box.append(pitch_spin)
+        pitch_row.add_suffix(pitch_box)
+        tuning_group.add(pitch_row)
+
+        # --- FOOTER ---
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12, halign=Gtk.Align.CENTER)
+        main_box.append(footer)
+
+        btn_preview = Gtk.Button(label="Preview Audio")
+        btn_preview.add_css_class("suggested-action")
+        btn_preview.connect("clicked", self.on_preview_clicked)
+        
+        btn_export = Gtk.Button(label="Export HQ MP3")
+        btn_export.connect("clicked", self.on_save_clicked)
+
+        footer.append(btn_preview)
+        footer.append(btn_export)
+
+        self.refresh_local_voices()
+        self.win.present()
+
+    # --- MENU ACTION HANDLERS ---
+    def on_about_action(self, action, param):
+        # UPDATED METADATA
+        about = Adw.AboutWindow(
+            transient_for=self.win,
+            application_name="Piper Studio Pro",
+            application_icon="com.zeroindex.piperstudio",
+            developer_name="ZeroIndex-x636A06",
+            version="1.0.0",
+            copyright="© 2026 ZeroIndex-x636A06",
+            issue_url="https://github.com/ZeroIndex-x636A06/piper-studio-pro/issues",
+            comments="A high-fidelity GUI frontend for the Piper neural text-to-speech engine, featuring real-time pitch shifting, speed adjustments, and direct Hugging Face integration."
+        )
+        about.present()
+
+    def on_manage_action(self, action, param):
+        mgr_win = Adw.Window(title="Manage Local Voices", modal=True, transient_for=self.win, default_width=450, default_height=500)
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        view.add_top_bar(header)
+        mgr_win.set_content(view)
+
+        list_box = Gtk.ListBox(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        list_box.add_css_class("boxed-list")
+
+        voices = [f for f in os.listdir(VOICE_DIR) if f.endswith(".onnx")]
+        if not voices:
+            row = Adw.ActionRow(title="No voices downloaded.")
+            list_box.append(row)
+        else:
+            for v in sorted(voices):
+                row = Adw.ActionRow(title=v)
+                
+                btn_del = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+                btn_del.add_css_class("destructive-action")
+                btn_del.set_tooltip_text("Delete Model")
+                btn_del.connect("clicked", self.on_delete_voice, v, row, list_box)
+                
+                row.add_suffix(btn_del)
+                list_box.append(row)
+
+        scrolled = Gtk.ScrolledWindow(child=list_box)
+        view.set_content(scrolled)
+        mgr_win.present()
+
+    def on_delete_voice(self, btn, v_name, row, list_box):
+        try:
+            os.remove(os.path.join(VOICE_DIR, v_name))
+            json_file = os.path.join(VOICE_DIR, v_name + ".json")
+            if os.path.exists(json_file):
+                os.remove(json_file)
+            
+            list_box.remove(row)
+            self.refresh_local_voices()
+        except Exception as e:
+            print(f"Failed to delete {v_name}: {e}")
+
+    # --- CORE LOGIC ---
+    def refresh_local_voices(self):
+        self.model_list.splice(0, self.model_list.get_n_items(), [])
+        voices = [f for f in os.listdir(VOICE_DIR) if f.endswith(".onnx")]
+        if not voices:
+            self.model_list.append("No voices found - Download one below")
+        else:
+            for v in sorted(voices): self.model_list.append(v)
+
+    def process_audio(self, out_path, preview=False):
+        text = self.text_view.get_buffer().get_text(self.text_view.get_buffer().get_start_iter(), self.text_view.get_buffer().get_end_iter(), True)
+        if not text.strip(): return
+
+        idx = self.voice_combo.get_selected()
+        model_name = self.model_list.get_string(idx)
+        model_path = os.path.join(VOICE_DIR, model_name)
+        if not os.path.exists(model_path): return
+
+        subprocess.run("killall -9 ffplay pw-play 2>/dev/null", shell=True)
+
+        raw_wav = "/tmp/piper_raw.wav"
+        piper_cmd = ["/opt/piper/piper", "--model", model_path, "--length_scale", str(self.speed_adj.get_value()), "--output_file", raw_wav]
+        p = subprocess.Popen(piper_cmd, stdin=subprocess.PIPE)
+        p.communicate(input=text.encode('utf-8'))
+
+        pitch = self.pitch_adj.get_value()
+        tempo_comp = 1.0 / pitch
+        ffmpeg_cmd = ["ffmpeg", "-i", raw_wav, "-y", "-loglevel", "quiet", "-af", f"asetrate=22050*{pitch},atempo={tempo_comp},loudnorm", out_path]
+        subprocess.run(ffmpeg_cmd)
+        
+        if preview:
+            subprocess.run(["pw-play", out_path])
+            if os.path.exists(out_path): os.remove(out_path)
+        if os.path.exists(raw_wav): os.remove(raw_wav)
+
+    def on_preview_clicked(self, _):
+        threading.Thread(target=self.process_audio, args=("/tmp/preview.wav", True), daemon=True).start()
+
+    def on_save_clicked(self, _):
+        dialog = Gtk.FileDialog(title="Export High Quality Audio")
+        dialog.set_initial_name(f"piper_clip_{datetime.now().strftime('%H%M')}.mp3")
+        dialog.save(parent=self.win, cancellable=None, callback=self.on_save_finish)
+
+    def on_save_finish(self, dialog, res):
+        try:
+            file = dialog.save_finish(res)
+            if file: threading.Thread(target=self.process_audio, args=(file.get_path(),), daemon=True).start()
+        except: pass
+
+    def on_custom_download(self, btn):
+        url = self.custom_url_entry.get_text().strip()
+        if not url.endswith('.onnx'):
+            print("Error: The URL must point directly to a .onnx file.")
+            return
+
+        btn.set_sensitive(False)
+        btn.set_label("Downloading...")
+
+        def do_dl():
+            try:
+                filename = url.split('/')[-1]
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req) as response:
+                    with open(os.path.join(VOICE_DIR, filename), 'wb') as f:
+                        f.write(response.read())
+                
+                json_url = url + ".json"
+                try:
+                    req_j = urllib.request.Request(json_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req_j) as response:
+                        with open(os.path.join(VOICE_DIR, filename + ".json"), 'wb') as f:
+                            f.write(response.read())
+                except Exception as json_err:
+                    print(f"Warning: Model downloaded, but matching .json failed: {json_err}")
+
+                GLib.idle_add(self.finish_custom_dl, btn)
+            except Exception as e:
+                print(f"Custom Download failed: {e}")
+                GLib.idle_add(lambda: self.reset_custom_btn(btn))
+
+        threading.Thread(target=do_dl, daemon=True).start()
+
+    def reset_custom_btn(self, btn):
+        btn.set_sensitive(True)
+        btn.set_label("Fetch Custom Model")
+        return False
+
+    def finish_custom_dl(self, btn):
+        self.reset_custom_btn(btn)
+        self.custom_url_entry.set_text("")
+        self.refresh_local_voices()
+        return False
+
+    def on_browse_voices(self, _):
+        dialog = Adw.AlertDialog(heading="Fetch Official List?", body="Connecting to Hugging Face to find available Piper models...")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("fetch", "Fetch")
+        dialog.set_default_response("fetch")
+        dialog.connect("response", self.on_fetch_response)
+        dialog.present()
+
+    def on_fetch_response(self, dialog, response):
+        if response == "fetch":
+            threading.Thread(target=self.fetch_voices_list, daemon=True).start()
+
+    def fetch_voices_list(self):
+        url = "https://huggingface.co/rhasspy/piper-voices/raw/v1.0.0/voices.json"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode())
+                GLib.idle_add(self.show_voice_browser, data)
+        except Exception as e:
+            print(f"Fetch failed: {e}")
+
+    def show_voice_browser(self, data):
+        browser = Adw.Window(title="Available English Voices", modal=True, transient_for=self.win, default_width=550, default_height=600)
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        
+        btn_stop = Gtk.Button(icon_name="media-playback-stop-symbolic")
+        btn_stop.set_tooltip_text("Stop All Playback")
+        btn_stop.connect("clicked", self.on_stop_playback)
+        header.pack_start(btn_stop)
+        
+        view.add_top_bar(header)
+        browser.set_content(view)
+
+        list_box = Gtk.ListBox(margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        list_box.add_css_class("boxed-list")
+        
+        for v_id, info in sorted(data.items()):
+            if info['language']['code'].startswith('en'):
+                row = Adw.ActionRow(title=v_id, subtitle=f"Quality: {info['quality']}")
+                onnx_path = list(info['files'].keys())[0] 
+                
+                btn_listen = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER)
+                btn_listen.set_tooltip_text("Listen to Sample")
+                btn_listen.connect("clicked", self.on_listen_to_sample, v_id, onnx_path)
+                row.add_suffix(btn_listen)
+
+                btn_dl = Gtk.Button(icon_name="folder-download-symbolic", valign=Gtk.Align.CENTER)
+                btn_dl.set_tooltip_text("Download Model")
+                btn_dl.connect("clicked", self.download_voice, onnx_path, browser)
+                row.add_suffix(btn_dl)
+                
+                list_box.append(row)
+        
+        scrolled = Gtk.ScrolledWindow(child=list_box)
+        view.set_content(scrolled)
+        browser.present()
+
+    def on_stop_playback(self, _):
+        subprocess.run("killall -9 ffplay pw-play 2>/dev/null", shell=True)
+
+    def on_listen_to_sample(self, btn, v_id, onnx_rel_path):
+        if btn.get_icon_name() == "media-playback-stop-symbolic":
+            subprocess.run("killall -9 ffplay pw-play 2>/dev/null", shell=True)
+            btn.set_icon_name("media-playback-start-symbolic")
+            return
+
+        subprocess.run("killall -9 ffplay pw-play 2>/dev/null", shell=True)
+        btn.set_sensitive(False)
+
+        def update_btn_ui(icon_name, sensitive):
+            btn.set_icon_name(icon_name)
+            btn.set_sensitive(sensitive)
+            return False 
+
+        def do_listen():
+            base_dir = os.path.dirname(onnx_rel_path)
+            hf_base = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+            
+            urls = [
+                f"{hf_base}{base_dir}/samples/speaker_0.mp3",
+                f"{hf_base}{base_dir}/samples/speaker_0.wav"
+            ]
+            
+            success = False
+            for url in urls:
+                try:
+                    ext = ".mp3" if ".mp3" in url else ".wav"
+                    temp_file = f"/tmp/sample_{v_id}{ext}"
+                    
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        with open(temp_file, 'wb') as f:
+                            f.write(response.read())
+                    
+                    if os.path.exists(temp_file) and os.path.getsize(temp_file) > 1000:
+                        GLib.idle_add(update_btn_ui, "media-playback-stop-symbolic", True)
+                        subprocess.run("killall -9 ffplay pw-play 2>/dev/null", shell=True)
+                        cmd = f"ffplay -v quiet -nodisp -autoexit '{temp_file}' 2>/dev/null"
+                        subprocess.run(cmd, shell=True) 
+                        success = True
+                        if os.path.exists(temp_file): os.remove(temp_file)
+                        break
+                except Exception as e:
+                    continue
+            
+            if not success:
+                print(f"Sample failed for {v_id}.")
+            
+            GLib.idle_add(update_btn_ui, "media-playback-start-symbolic", True)
+
+        threading.Thread(target=do_listen, daemon=True).start()
+
+    def download_voice(self, btn, onnx_rel_path, browser):
+        btn.set_sensitive(False)
+        def do_dl():
+            base_url = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+            try:
+                for ext in ["", ".json"]:
+                    url = f"{base_url}{onnx_rel_path}{ext}"
+                    local_filename = os.path.basename(f"{onnx_rel_path}{ext}")
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req) as response:
+                        with open(os.path.join(VOICE_DIR, local_filename), 'wb') as f:
+                            f.write(response.read())
+                GLib.idle_add(self.finish_dl, browser)
+            except Exception as e:
+                print(f"Download failed: {e}")
+        threading.Thread(target=do_dl, daemon=True).start()
+
+    def finish_dl(self, browser):
+        browser.close()
+        self.refresh_local_voices()
+
+if __name__ == "__main__":
+    app = PiperStudio()
+    app.run(None)
