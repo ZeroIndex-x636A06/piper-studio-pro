@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.png" width="128" height="128" alt="Piper Studio Pro Icon">
+</p>
+
 # piper-studio-pro
 Piper Studio Pro: A high-fidelity GTK4/libadwaita frontend for the Piper neural text-to-speech engine. Built natively for Linux, Piper Studio Pro allows you to generate, preview, and export high-quality AI speech seamlessly.
 
