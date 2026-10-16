@@ -1,0 +1,147 @@
+# Weekly-audit harness: runs install.sh as a normal user (as the README
+# says), synthesises real speech through the installed Piper engine with the
+# app's exact piper/ffmpeg pipeline, and launches the GTK app under Xvfb.
+name: audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/audit.yml']
+
+permissions:
+  contents: read
+
+env:
+  VOICE: en_US-lessac-medium
+  VOICE_URL: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: pipx install ruff && pipx install bandit
+      - id: shell_syntax
+        continue-on-error: true
+        run: bash -n install.sh && bash -n uninstall.sh
+      - id: shellcheck_errors
+        continue-on-error: true
+        run: shellcheck -S error install.sh uninstall.sh
+      - id: python_compiles
+        continue-on-error: true
+        run: python3 -m py_compile piper-studio
+      - id: ruff_errors   # undefined names, syntax errors
+        continue-on-error: true
+        run: ruff check --select E9,F63,F7,F82 piper-studio
+      - name: ruff (all, informational)
+        run: ruff check piper-studio || true
+      - id: bandit_high
+        continue-on-error: true
+        run: bandit -lll piper-studio
+      - name: bandit (all, informational)
+        run: bandit piper-studio || true
+      - id: secret_scan
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
+
+  install-and-run:
+    runs-on: ubuntu-latest   # Ubuntu 24.04: libadwaita 1.5, python3-gi on /usr/bin/python3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: piper studio src   # path with spaces on purpose
+      - id: refuses_root
+        continue-on-error: true
+        working-directory: piper studio src
+        run: '! sudo ./install.sh'
+      - id: install
+        continue-on-error: true
+        working-directory: piper studio src
+        run: chmod +x install.sh && ./install.sh
+      - id: installed_files
+        continue-on-error: true
+        run: |
+          test -x /opt/piper/piper
+          test -x "$HOME/.local/bin/piper-studio"
+          test -f "$HOME/.local/share/icons/com.zeroindex.piperstudio.png"
+          desktop-file-validate "$HOME/.local/share/applications/com.zeroindex.piperstudio.desktop"
+      - name: download a voice into the app's voice dir
+        run: |
+          mkdir -p ~/.local/share/piper/voices && cd ~/.local/share/piper/voices
+          curl -fsSLO "$VOICE_URL/$VOICE.onnx" && curl -fsSLO "$VOICE_URL/$VOICE.onnx.json"
+      # Same commands process_audio() runs (piper-studio, "piper_cmd"/"ffmpeg_cmd").
+      - id: synthesize_speech
+        continue-on-error: true
+        run: |
+          echo "Weekly audit speech test." | /opt/piper/piper --model ~/.local/share/piper/voices/"$VOICE".onnx --length_scale 1.0 --output_file "$RUNNER_TEMP/raw.wav"
+          test -s "$RUNNER_TEMP/raw.wav"
+      - id: export_mp3_pipeline
+        continue-on-error: true
+        run: |
+          ffmpeg -i "$RUNNER_TEMP/raw.wav" -y -loglevel error -af "asetrate=22050*1.0,atempo=1.0,loudnorm" "$RUNNER_TEMP/out file.mp3"
+          ffprobe -v error -show_entries format=duration -of csv=p=0 "$RUNNER_TEMP/out file.mp3"
+      - id: gui_starts_headless
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y xvfb >/dev/null
+          set +e
+          dbus-run-session -- xvfb-run -a timeout 15 "$HOME/.local/bin/piper-studio" 2> "$RUNNER_TEMP/gui.err"; rc=$?
+          cat "$RUNNER_TEMP/gui.err"
+          # 124 = still running when timeout killed it (i.e. it started and stayed up)
+          [ "$rc" -eq 124 ] && ! grep -q Traceback "$RUNNER_TEMP/gui.err"
+      - id: uninstall
+        continue-on-error: true
+        working-directory: piper studio src
+        run: |
+          chmod +x uninstall.sh && echo n | ./uninstall.sh
+          test ! -e "$HOME/.local/bin/piper-studio"
+          test -f ~/.local/share/piper/voices/"$VOICE".onnx   # answered "n": voices kept
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
+
+  # install.sh's dnf/pacman branches (system deps only; no display).
+  install-deps-distros:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['archlinux:latest', 'fedora:latest']
+    container: ${{ matrix.image }}
+    steps:
+      - name: bootstrap a non-root sudo user (install.sh refuses root)
+        run: |
+          if command -v pacman >/dev/null; then pacman -Sy --noconfirm sudo git jq; else dnf install -y sudo git jq; fi
+          useradd -m tester && echo 'tester ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tester
+      - uses: actions/checkout@v4
+      - id: install
+        continue-on-error: true
+        run: chown -R tester . && sudo -u tester -H ./install.sh
+      - id: python_gi_imports
+        continue-on-error: true
+        run: python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Gtk, Adw; print(Adw.get_major_version(), Adw.get_minor_version())"
+      - id: piper_installed
+        continue-on-error: true
+        run: test -x /opt/piper/piper && command -v ffmpeg
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
