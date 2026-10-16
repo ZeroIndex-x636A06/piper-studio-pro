@@ -132,6 +132,9 @@ jobs:
       matrix:
         image: ['archlinux:latest', 'fedora:latest']
     container: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash   # containers default to sh; checks use bash syntax
     steps:
       - name: bootstrap a non-root sudo user (install.sh refuses root)
         run: |
