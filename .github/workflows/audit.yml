@@ -138,7 +138,7 @@ jobs:
     steps:
       - name: bootstrap a non-root sudo user (install.sh refuses root)
         run: |
-          if command -v pacman >/dev/null; then pacman -Sy --noconfirm sudo git jq; else dnf install -y sudo git jq; fi
+          if command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed sudo git jq; else dnf install -y sudo git jq; fi
           useradd -m tester && echo 'tester ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tester
       - uses: actions/checkout@v5
       - id: install
